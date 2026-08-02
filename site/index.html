@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      name="description"
+      content="An all-time ranking of developers in Singapore by public GitHub contributions."
+    >
+    <meta name="theme-color" content="#ffffff">
+    <title>GitHub Ranking Singapore</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="./styles.css">
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#ranking">Skip to ranking</a>
+
+    <header class="site-header">
+      <nav class="nav" aria-label="Main navigation">
+        <a class="site-name" href="./">GitHub Ranking Singapore</a>
+        <a
+          class="source-link"
+          href="https://github.com/ayaka14732/github-ranking-singapore"
+        >
+          GitHub <span aria-hidden="true">↗</span>
+        </a>
+      </nav>
+
+      <h1>Singapore GitHub Ranking</h1>
+      <p class="description">
+        An all-time ranking of developers in Singapore by public GitHub contributions.
+      </p>
+      <p class="summary" aria-label="Ranking summary">
+        <span><strong id="developer-count">&mdash;</strong> developers</span>
+        <span><strong id="contribution-count">&mdash;</strong> contributions</span>
+        <span>Updated weekly</span>
+      </p>
+    </header>
+
+    <main id="ranking" class="ranking" tabindex="-1">
+      <div class="ranking-header">
+        <h2>Ranking</h2>
+
+        <label class="search">
+          <span class="visually-hidden">Search developers</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m21 21-4.35-4.35m2.35-5.4A7.75 7.75 0 1 1 3.5 11.25a7.75 7.75 0 0 1 15.5 0Z" />
+          </svg>
+          <input id="search" type="search" placeholder="Search developers" autocomplete="off">
+        </label>
+      </div>
+
+      <p id="result-status" class="result-status" aria-live="polite">Loading ranking&hellip;</p>
+
+      <div class="table-shell">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Rank</th>
+              <th scope="col">Developer</th>
+              <th scope="col">Public contributions</th>
+            </tr>
+          </thead>
+          <tbody id="ranking-rows">
+            <tr>
+              <td class="loading" colspan="3">Loading ranking data&hellip;</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </main>
+
+    <footer>
+      <p>
+        Profile locations are self-reported, and GitHub Search exposes at most
+        1,000 results. Private contributions are excluded.
+      </p>
+      <a href="https://github.com/ayaka14732/github-ranking-singapore#ranking-methodology">
+        Read the methodology
+      </a>
+    </footer>
+  </body>
+</html>

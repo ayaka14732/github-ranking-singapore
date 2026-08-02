@@ -1,0 +1,4 @@
+node_modules/
+*.checkpoint.json
+*.tmp
+site/ranking.json

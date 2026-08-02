@@ -1,0 +1,15 @@
+{
+  "name": "github-ranking-singapore",
+  "version": "1.0.0",
+  "private": true,
+  "description": "All-time public GitHub contribution ranking for developers in Singapore",
+  "type": "module",
+  "scripts": {
+    "check": "node --check scripts/update-ranking.mjs && node --check site/app.js",
+    "update": "node scripts/update-ranking.mjs --format json --output site/ranking.json"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
