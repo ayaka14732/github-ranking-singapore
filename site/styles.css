@@ -40,8 +40,7 @@ a {
 }
 
 .site-header,
-.ranking,
-footer {
+.ranking {
   width: min(860px, calc(100% - 40px));
   margin-inline: auto;
 }
@@ -110,6 +109,25 @@ h2 {
 .summary strong {
   color: var(--text);
   font-weight: 600;
+}
+
+.project-notes {
+  max-width: 700px;
+  margin: 20px 0 0;
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.project-notes p {
+  margin: 4px 0 0;
+}
+
+.project-notes p:first-child {
+  margin-top: 0;
+}
+
+.project-notes a {
+  text-underline-offset: 3px;
 }
 
 .ranking {
@@ -239,26 +257,6 @@ td:last-child {
   color: #cf222e;
 }
 
-footer {
-  display: flex;
-  justify-content: space-between;
-  gap: 24px;
-  padding: 24px 0 40px;
-  border-top: 1px solid var(--border);
-  color: var(--muted);
-  font-size: 0.8125rem;
-}
-
-footer p {
-  max-width: 600px;
-  margin: 0;
-}
-
-footer a {
-  flex: 0 0 auto;
-  text-underline-offset: 3px;
-}
-
 .visually-hidden {
   position: absolute;
   width: 1px;
@@ -271,8 +269,7 @@ footer a {
 
 @media (max-width: 600px) {
   .site-header,
-  .ranking,
-  footer {
+  .ranking {
     width: calc(100% - 24px);
   }
 
@@ -280,8 +277,7 @@ footer a {
     margin-bottom: 40px;
   }
 
-  .ranking-header,
-  footer {
+  .ranking-header {
     align-items: stretch;
     flex-direction: column;
   }
