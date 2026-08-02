@@ -7,6 +7,10 @@ import https from "node:https";
 const API_URL = "https://api.github.com/graphql";
 const SEARCH_QUERY = "location:singapore sort:followers-desc";
 const SEARCH_RESULT_LIMIT = 1_000;
+const MAX_REQUEST_ATTEMPTS = 7;
+const MIN_REQUEST_INTERVAL_MS = 1_100;
+const MIN_RATE_LIMIT_DELAY_MS = 60_000;
+const MAX_RATE_LIMIT_DELAY_MS = 5 * 60_000;
 
 function usage() {
   return `Usage: node scripts/update-ranking.mjs [options]
@@ -18,7 +22,7 @@ Options:
   --format <markdown|csv|json>  Output format (default: markdown)
   --output <path>               Write to a file instead of stdout
   --limit <number>              Only inspect the first N search results
-  --concurrency <number>        Concurrent GitHub requests (default: 2)
+  --concurrency <number>        Concurrent GitHub requests (default: 1)
   --help                        Show this help
 
 Authentication is read from GITHUB_TOKEN, CUSTOM_TOKEN, or “gh auth token”.
@@ -38,7 +42,7 @@ function parseArgs(argv) {
     format: "markdown",
     output: null,
     limit: SEARCH_RESULT_LIMIT,
-    concurrency: 2,
+    concurrency: 1,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -95,12 +99,64 @@ let nextRequestAt = 0;
 
 function waitForRequestSlot() {
   const slot = requestQueue.then(async () => {
-    const wait = Math.max(0, nextRequestAt - Date.now());
-    if (wait) await delay(wait);
-    nextRequestAt = Date.now() + 1_100;
+    // Recheck after sleeping because another in-flight request may extend the
+    // shared cooldown when it receives a secondary-rate-limit response.
+    while (nextRequestAt > Date.now()) {
+      await delay(nextRequestAt - Date.now());
+    }
+    nextRequestAt = Date.now() + MIN_REQUEST_INTERVAL_MS;
   });
   requestQueue = slot.catch(() => {});
   return slot;
+}
+
+function pauseAllRequests(milliseconds) {
+  nextRequestAt = Math.max(nextRequestAt, Date.now() + milliseconds);
+}
+
+function retryDelay(response, messages, attempt) {
+  const retryAfterSeconds = Number(response.headers["retry-after"]);
+  const retryAfter = Number.isFinite(retryAfterSeconds)
+    ? retryAfterSeconds * 1_000
+    : 0;
+  const remaining = Number(response.headers["x-ratelimit-remaining"]);
+  const resetSeconds = Number(response.headers["x-ratelimit-reset"]);
+  const resetDelay =
+    remaining === 0 && Number.isFinite(resetSeconds)
+      ? Math.max(0, resetSeconds * 1_000 - Date.now()) + 1_000
+      : 0;
+  const rateLimited =
+    response.statusCode === 429 ||
+    response.statusCode === 403 ||
+    /rate limit|submitted too quickly/i.test(messages || "");
+
+  if (rateLimited) {
+    const exponentialDelay = Math.min(
+      MIN_RATE_LIMIT_DELAY_MS * 2 ** (attempt - 1),
+      MAX_RATE_LIMIT_DELAY_MS,
+    );
+    return Math.max(retryAfter, resetDelay, exponentialDelay);
+  }
+  return Math.max(retryAfter, 1_000 * 2 ** (attempt - 1));
+}
+
+function isRetryableResponse(response, messages) {
+  return (
+    response.statusCode === 429 ||
+    (response.statusCode === 403 && /secondary rate limit/i.test(messages || "")) ||
+    (Boolean(messages) && Number(response.headers["x-ratelimit-remaining"]) === 0) ||
+    (response.statusCode >= 500 && response.statusCode <= 503) ||
+    /rate limit|submitted too quickly|temporarily unavailable/i.test(messages || "")
+  );
+}
+
+function pauseBeforeRetry(response, messages, attempt) {
+  const wait = retryDelay(response, messages, attempt);
+  pauseAllRequests(wait);
+  process.stderr.write(
+    `GitHub request will be retried; pausing all requests for ${Math.ceil(wait / 1_000)}s ` +
+      `(retry ${attempt}/${MAX_REQUEST_ATTEMPTS - 1}).\n`,
+  );
 }
 
 async function requestGraphQL(token, query, variables, attempt = 1) {
@@ -136,33 +192,32 @@ async function requestGraphQL(token, query, variables, attempt = 1) {
           }
 
           if (!payload) {
-            if (attempt < 5) {
-              await delay(1_000 * 2 ** (attempt - 1));
+            const retryable =
+              isRetryableResponse(response, responseBody) ||
+              (response.statusCode >= 200 && response.statusCode < 300);
+            if (retryable && attempt < MAX_REQUEST_ATTEMPTS) {
+              pauseBeforeRetry(response, responseBody, attempt);
               try {
                 resolve(await requestGraphQL(token, query, variables, attempt + 1));
               } catch (error) {
                 reject(error);
               }
             } else {
-              reject(new Error("GitHub returned an empty or non-JSON response"));
+              reject(
+                new Error(
+                  `GitHub returned HTTP ${response.statusCode} with an empty or non-JSON response`,
+                ),
+              );
             }
             return;
           }
 
           const messages =
             payload?.errors?.map((error) => error.message).join("; ") || payload?.message;
-          const retryable =
-            response.statusCode === 429 ||
-            (response.statusCode === 403 && /secondary rate limit/i.test(messages || "")) ||
-            (response.statusCode >= 500 && response.statusCode <= 503) ||
-            /secondary rate limit|submitted too quickly|temporarily unavailable/i.test(messages || "");
+          const retryable = isRetryableResponse(response, messages);
 
-          if (retryable && attempt < 5) {
-            const retryAfter = Number(response.headers["retry-after"] || 0) * 1_000;
-            const secondaryLimitDelay = /secondary rate limit/i.test(messages || "")
-              ? 30_000 * attempt
-              : 1_000 * 2 ** (attempt - 1);
-            await delay(Math.max(retryAfter, secondaryLimitDelay));
+          if (retryable && attempt < MAX_REQUEST_ATTEMPTS) {
+            pauseBeforeRetry(response, messages, attempt);
             try {
               resolve(await requestGraphQL(token, query, variables, attempt + 1));
             } catch (error) {

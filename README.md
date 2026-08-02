@@ -35,7 +35,7 @@ node scripts/update-ranking.mjs --format csv --output ranking.csv
 node scripts/update-ranking.mjs --format markdown --output ranking.md
 ```
 
-If an update is interrupted, a checkpoint is saved. Running the update again on the same day resumes from that checkpoint, which is automatically deleted after a successful run.
+If an update is interrupted, a checkpoint is saved. Running the update again on the same day resumes from that checkpoint, which is automatically deleted after a successful run. GitHub Actions also caches this checkpoint after a failed update, so rerunning the workflow does not discard completed API work.
 
 ## Automated updates
 

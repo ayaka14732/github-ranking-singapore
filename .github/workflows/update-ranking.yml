@@ -32,10 +32,26 @@ jobs:
           node-version: 24
           package-manager-cache: false
 
+      - name: Restore ranking checkpoint
+        id: ranking-checkpoint
+        uses: actions/cache/restore@v4
+        with:
+          path: site/ranking.json.checkpoint.json
+          key: ranking-checkpoint-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ranking-checkpoint-${{ runner.os }}-
+
       - name: Generate ranking data
         run: npm run update
         env:
           GITHUB_TOKEN: ${{ secrets.RANKING_TOKEN || github.token }}
+
+      - name: Save ranking checkpoint after a failed update
+        if: ${{ failure() && hashFiles('site/ranking.json.checkpoint.json') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: site/ranking.json.checkpoint.json
+          key: ${{ steps.ranking-checkpoint.outputs.cache-primary-key }}
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
