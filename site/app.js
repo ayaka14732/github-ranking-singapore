@@ -38,6 +38,12 @@ function renderRanking(users) {
     const profile = document.createElement("a");
     profile.href = `https://github.com/${encodeURIComponent(user.login)}`;
     profile.textContent = user.login;
+    profile.target = "_blank";
+    profile.rel = "noopener";
+    profile.setAttribute(
+      "aria-label",
+      `${user.login} on GitHub (opens in a new tab)`,
+    );
 
     developerCell.append(profile);
 
