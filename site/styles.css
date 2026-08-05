@@ -71,48 +71,6 @@ input:focus-visible {
   border-bottom: 1px solid var(--border);
 }
 
-.nav {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 64px;
-}
-
-.site-name {
-  color: var(--text);
-  font-weight: 700;
-  letter-spacing: -0.01em;
-  text-decoration: none;
-}
-
-.source-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  margin-right: -9px;
-  padding: 5px 9px;
-  border: 1px solid transparent;
-  border-radius: 7px;
-  color: var(--muted);
-  font-size: 0.875rem;
-  text-decoration: none;
-  transition:
-    color 120ms ease,
-    background-color 120ms ease,
-    border-color 120ms ease;
-}
-
-.source-link:hover {
-  border-color: var(--border);
-  color: var(--text);
-  background: var(--surface);
-}
-
-.site-name:hover {
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-
 h1,
 h2 {
   margin: 0;
@@ -356,10 +314,6 @@ td:last-child {
   .site-header,
   .ranking {
     width: calc(100% - 24px);
-  }
-
-  .nav {
-    margin-bottom: 44px;
   }
 
   .ranking-header {
