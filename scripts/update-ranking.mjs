@@ -376,7 +376,7 @@ async function addAllTimeCounts(token, users, store, saveData) {
   const pendingUsers = users.filter((user) => user.pendingYears.length);
   // Start with a compact batch and split it automatically if GitHub assigns
   // more resource cost to a group of particularly active accounts.
-  const batches = chunksByWeight(pendingUsers, 40, (user) => user.pendingYears.length);
+  const batches = chunksByWeight(pendingUsers, 20, (user) => user.pendingYears.length);
   let completed = users.length - pendingUsers.length;
 
   async function loadBatch(batch) {
