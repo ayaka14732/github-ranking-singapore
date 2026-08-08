@@ -5,8 +5,9 @@
   "description": "All-time public GitHub contribution ranking for developers in Singapore",
   "type": "module",
   "scripts": {
-    "check": "node --check scripts/update-ranking.mjs && node --check scripts/data-branch.mjs && node --check site/app.js",
+    "check": "node --check scripts/update-ranking.mjs && node --check scripts/data-branch.mjs && node --check scripts/render-page.mjs && node --check site/app.js",
     "update": "node scripts/update-ranking.mjs",
+    "render": "node scripts/render-page.mjs",
     "data:pull": "node scripts/data-branch.mjs pull data/contributions.json",
     "data:push": "node scripts/data-branch.mjs push data/contributions.json"
   },

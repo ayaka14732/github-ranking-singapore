@@ -40,6 +40,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RANKING_TOKEN || github.token }}
 
+      - name: Render static ranking page
+        run: node scripts/render-page.mjs
+
       - name: Publish contribution data
         if: ${{ !cancelled() && hashFiles('data/contributions.json') != '' }}
         run: node scripts/data-branch.mjs push data/contributions.json

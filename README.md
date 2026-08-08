@@ -40,7 +40,7 @@ The first full run queries every active year of every user and can take a long t
 
 ## Automated updates
 
-GitHub Actions rebuilds and deploys the website on every push to `main` and every Monday at 02:00 Singapore Time. Each run downloads the per-year contribution data from the `ranking-data` branch, refreshes the current year (and any newly discovered users), and pushes the updated data back to that branch. It uses the repository's `GITHUB_TOKEN` by default. If you encounter API permission or rate-limit issues, create a `RANKING_TOKEN` repository secret.
+GitHub Actions rebuilds and deploys the website on every push to `main` and every Monday at 02:00 Singapore Time. Each run downloads the per-year contribution data from the `ranking-data` branch, refreshes the current year (and any newly discovered users), and pushes the updated data back to that branch. The ranking is also rendered into static HTML by `scripts/render-page.mjs`, so the table is visible to search engines and to browsers without JavaScript. The workflow uses the repository's `GITHUB_TOKEN` by default. If you encounter API permission or rate-limit issues, create a `RANKING_TOKEN` repository secret.
 
 Initialize the data branch locally before the first automated run (see above), so that the workflow never needs to re-query every historical year.
 
