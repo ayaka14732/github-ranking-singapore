@@ -28,17 +28,20 @@ Open <http://localhost:8000> to preview the site. The generated `site/ranking.js
 
 If you have already run `gh auth login`, the script can read the token directly from `gh auth token`, so you do not need to set the environment variable. Do not use or commit browser cookies.
 
-Other output formats:
+Per-year contribution totals are cached in `data/contributions.json`. Historical years never change, so later runs only query the current year and newly discovered users, and an interrupted run resumes from the cached years. The file is ignored by Git locally and synchronized with the dedicated `ranking-data` branch:
 
 ```sh
-node scripts/update-ranking.mjs --format csv --output ranking.csv
-node scripts/update-ranking.mjs --format markdown --output ranking.md
+npm run data:pull   # download the data file from the ranking-data branch (optional)
+npm run update      # build the ranking, updating the data file
+npm run data:push   # commit the data file to the ranking-data branch and push it
 ```
 
-If an update is interrupted, a checkpoint is saved. Running the update again on the same day resumes from that checkpoint, which is automatically deleted after a successful run. GitHub Actions also caches this checkpoint after a failed update, so rerunning the workflow does not discard completed API work.
+The first full run queries every active year of every user and can take a long time. Run it locally once and push the data branch, so that automated updates only ever perform the cheap incremental refresh.
 
 ## Automated updates
 
-GitHub Actions rebuilds and deploys the website on every push to `main` and every Monday at 02:00 Singapore Time. It uses the repository's `GITHUB_TOKEN` by default. If you encounter API permission or rate-limit issues, create a `RANKING_TOKEN` repository secret.
+GitHub Actions rebuilds and deploys the website on every push to `main` and every Monday at 02:00 Singapore Time. Each run downloads the per-year contribution data from the `ranking-data` branch, refreshes the current year (and any newly discovered users), and pushes the updated data back to that branch. It uses the repository's `GITHUB_TOKEN` by default. If you encounter API permission or rate-limit issues, create a `RANKING_TOKEN` repository secret.
+
+Initialize the data branch locally before the first automated run (see above), so that the workflow never needs to re-query every historical year.
 
 In the repository settings, set **Pages → Build and deployment → Source** to **GitHub Actions**. Ranking data is deployed directly to GitHub Pages and is never committed to the repository.

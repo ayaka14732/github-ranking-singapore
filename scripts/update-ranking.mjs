@@ -1,29 +1,34 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import https from "node:https";
+import { dirname } from "node:path";
 
 const API_URL = "https://api.github.com/graphql";
 const SEARCH_QUERY = "location:singapore sort:followers-desc";
 const SEARCH_RESULT_LIMIT = 1_000;
+const OUTPUT_PATH = "site/ranking.json";
+const DATA_PATH = "data/contributions.json";
 const MAX_REQUEST_ATTEMPTS = 7;
 const MIN_REQUEST_INTERVAL_MS = 1_100;
 const MIN_RATE_LIMIT_DELAY_MS = 60_000;
 const MAX_RATE_LIMIT_DELAY_MS = 5 * 60_000;
 
 function usage() {
-  return `Usage: node scripts/update-ranking.mjs [options]
+  return `Usage: node scripts/update-ranking.mjs [--limit <number>]
 
 Build an all-time ranking for GitHub users whose profile location matches
-Singapore. The score is public contribution-calendar activity, summed by year.
+Singapore, and write ${OUTPUT_PATH}. The score is public
+contribution-calendar activity, summed by year.
+
+Per-year contribution totals are cached in ${DATA_PATH}. Historical years
+never change, so later runs only query the current year and newly discovered
+users, and an interrupted run resumes from the cached years.
 
 Options:
-  --format <markdown|csv|json>  Output format (default: markdown)
-  --output <path>               Write to a file instead of stdout
-  --limit <number>              Only inspect the first N search results
-  --concurrency <number>        Concurrent GitHub requests (default: 1)
-  --help                        Show this help
+  --limit <number>  Only inspect the first N search results (for testing)
+  --help            Show this help
 
 Authentication is read from GITHUB_TOKEN, CUSTOM_TOKEN, or “gh auth token”.
 `;
@@ -38,38 +43,21 @@ function parsePositiveInteger(value, option) {
 }
 
 function parseArgs(argv) {
-  const options = {
-    format: "markdown",
-    output: null,
-    limit: SEARCH_RESULT_LIMIT,
-    concurrency: 1,
-  };
+  const options = { limit: SEARCH_RESULT_LIMIT };
 
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--help") {
       options.help = true;
-    } else if (argument === "--format") {
-      options.format = argv[++index];
-    } else if (argument === "--output") {
-      options.output = argv[++index];
     } else if (argument === "--limit") {
       options.limit = parsePositiveInteger(argv[++index], "--limit");
-    } else if (argument === "--concurrency") {
-      options.concurrency = parsePositiveInteger(argv[++index], "--concurrency");
     } else {
       throw new Error(`Unknown option: ${argument}`);
     }
   }
 
-  if (!new Set(["markdown", "csv", "json"]).has(options.format)) {
-    throw new Error("--format must be markdown, csv, or json");
-  }
   if (options.limit > SEARCH_RESULT_LIMIT) {
     throw new Error(`--limit cannot exceed GitHub Search's ${SEARCH_RESULT_LIMIT}-result limit`);
-  }
-  if (options.concurrency > 10) {
-    throw new Error("--concurrency cannot exceed 10");
   }
   return options;
 }
@@ -272,25 +260,6 @@ function chunksByWeight(array, maximumWeight, getWeight) {
   return result;
 }
 
-async function mapConcurrent(array, concurrency, worker) {
-  const results = new Array(array.length);
-  let nextIndex = 0;
-
-  async function run() {
-    while (true) {
-      const index = nextIndex;
-      nextIndex += 1;
-      if (index >= array.length) return;
-      results[index] = await worker(array[index], index);
-    }
-  }
-
-  await Promise.all(
-    Array.from({ length: Math.min(concurrency, array.length) }, () => run()),
-  );
-  return results;
-}
-
 async function searchSingaporeUsers(token, limit) {
   const query = `
     query($search: String!, $cursor: String) {
@@ -338,11 +307,11 @@ async function searchSingaporeUsers(token, limit) {
   return users;
 }
 
-async function addContributionYears(token, users, concurrency) {
+async function addContributionYears(token, users) {
   const batches = chunks(users, 30);
   let completed = 0;
 
-  await mapConcurrent(batches, concurrency, async (batch) => {
+  for (const batch of batches) {
     const fields = batch
       .map(
         (user, index) =>
@@ -360,7 +329,7 @@ async function addContributionYears(token, users, concurrency) {
 
     completed += batch.length;
     process.stderr.write(`Loaded active years: ${completed}/${users.length}\r`);
-  });
+  }
   process.stderr.write("\n");
 }
 
@@ -375,19 +344,45 @@ function contributionCollectionField(year, currentYear, now) {
   }`;
 }
 
-async function addAllTimeCounts(token, users, concurrency, onBatch = async () => {}) {
+function sumContributions(user, currentYear, fresh) {
+  let total = 0;
+  for (const year of user.years) {
+    if (year > currentYear) continue;
+    const value =
+      year === currentYear ? fresh[year] : (user.cachedYears[year] ?? fresh[year]);
+    total += value ?? 0;
+  }
+  return total;
+}
+
+async function addAllTimeCounts(token, users, store, saveData) {
   const now = new Date();
   const currentYear = now.getUTCFullYear();
+
+  // Historical years never change, so only the current year and years missing
+  // from the persistent store are queried again.
+  for (const user of users) {
+    user.cachedYears = store.users[user.login.toLowerCase()]?.years ?? {};
+    user.pendingYears = user.years.filter(
+      (year) =>
+        year <= currentYear &&
+        (year === currentYear || user.cachedYears[year] == null),
+    );
+    if (!user.pendingYears.length) {
+      user.contributions = sumContributions(user, currentYear, {});
+    }
+  }
+
+  const pendingUsers = users.filter((user) => user.pendingYears.length);
   // Start with a compact batch and split it automatically if GitHub assigns
   // more resource cost to a group of particularly active accounts.
-  const batches = chunksByWeight(users, 40, (user) => user.years.length);
-  let completed = 0;
+  const batches = chunksByWeight(pendingUsers, 40, (user) => user.pendingYears.length);
+  let completed = users.length - pendingUsers.length;
 
   async function loadBatch(batch) {
     const fields = batch
       .map((user, index) => {
-        const years = user.years
-          .filter((year) => year <= currentYear)
+        const years = user.pendingYears
           .map((year) => contributionCollectionField(year, currentYear, now))
           .join("\n");
         return `u${index}: user(login: ${JSON.stringify(user.login)}) { ${years} }`;
@@ -398,7 +393,7 @@ async function addAllTimeCounts(token, users, concurrency, onBatch = async () =>
       data = await requestGraphQL(token, `query { ${fields} }`, {});
     } catch (error) {
       if (
-        /Resource limits for this query exceeded|HTTP 504/i.test(error.message) &&
+        /Resource limits for this query exceeded|HTTP 50[24]/i.test(error.message) &&
         batch.length > 1
       ) {
         const middle = Math.ceil(batch.length / 2);
@@ -413,42 +408,66 @@ async function addAllTimeCounts(token, users, concurrency, onBatch = async () =>
       const result = data[`u${index}`];
       if (!result) throw new Error(`GitHub user disappeared while querying: ${user.login}`);
 
-      user.contributions = 0;
-      for (const year of user.years) {
+      const fresh = {};
+      for (const year of user.pendingYears) {
         const yearResult = result[`y${year}`];
         if (!yearResult) continue;
         const total = yearResult.contributionCalendar.totalContributions;
         const privateContributions = yearResult.restrictedContributionsCount;
-        user.contributions += Math.max(0, total - privateContributions);
+        fresh[year] = Math.max(0, total - privateContributions);
       }
+
+      const entry = (store.users[user.login.toLowerCase()] ??= { years: {} });
+      for (const year of user.pendingYears) {
+        if (year !== currentYear && fresh[year] != null) {
+          entry.years[year] = fresh[year];
+          user.cachedYears[year] = fresh[year];
+        }
+      }
+
+      user.contributions = sumContributions(user, currentYear, fresh);
     });
 
     completed += batch.length;
     process.stderr.write(`Loaded contributions: ${completed}/${users.length}\r`);
-    await onBatch(batch);
+    await saveData();
   }
 
-  await mapConcurrent(batches, concurrency, loadBatch);
+  for (const batch of batches) {
+    await loadBatch(batch);
+  }
   process.stderr.write("\n");
 }
 
-async function readCheckpoint(path, date) {
+async function readDataFile(path) {
+  let raw;
   try {
-    const checkpoint = JSON.parse(await readFile(path, "utf8"));
-    if (checkpoint.version === 1 && checkpoint.date === date) return checkpoint;
+    raw = await readFile(path, "utf8");
   } catch (error) {
-    if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+    if (error.code === "ENOENT") return { version: 1, users: {} };
+    throw error;
   }
-  return { version: 1, date, users: {} };
+
+  let store;
+  try {
+    store = JSON.parse(raw);
+  } catch {
+    throw new Error(`Data file ${path} is not valid JSON; fix or delete it`);
+  }
+  if (store?.version !== 1 || !store.users || typeof store.users !== "object") {
+    throw new Error(`Data file ${path} has an unsupported format; fix or delete it`);
+  }
+  return store;
 }
 
-function createCheckpointWriter(path, checkpoint) {
+function createDataWriter(path, store) {
   const temporaryPath = `${path}.tmp`;
   let queue = Promise.resolve();
 
-  return function saveCheckpoint() {
-    const snapshot = `${JSON.stringify(checkpoint)}\n`;
+  return function saveData() {
+    const snapshot = `${JSON.stringify(store)}\n`;
     queue = queue.then(async () => {
+      await mkdir(dirname(path), { recursive: true });
       await writeFile(temporaryPath, snapshot, "utf8");
       await rename(temporaryPath, path);
     });
@@ -463,53 +482,11 @@ function sortRanking(users) {
         right.contributions - left.contributions ||
         left.login.localeCompare(right.login, "en", { sensitivity: "base" }),
     )
-    .map((user, index) => ({ rank: index + 1, ...user }));
-}
-
-function escapeMarkdown(value) {
-  return String(value).replaceAll("|", "\\|");
-}
-
-function escapeCsv(value) {
-  const string = String(value);
-  return /[",\n\r]/.test(string) ? `"${string.replaceAll('"', '""')}"` : string;
-}
-
-function formatRanking(ranking, format) {
-  if (format === "json") {
-    return `${JSON.stringify(
-      ranking.map(({ rank, login, contributions }) => ({
-        rank,
-        login,
-        contributions,
-      })),
-      null,
-      2,
-    )}\n`;
-  }
-
-  if (format === "csv") {
-    const rows = ["rank,login,contributions"];
-    for (const user of ranking) {
-      rows.push(
-        [user.rank, user.login, user.contributions].map(escapeCsv).join(","),
-      );
-    }
-    return `${rows.join("\n")}\n`;
-  }
-
-  const rows = [
-    "| # | User | Public contributions |",
-    "|--:|:-----|--------------:|",
-  ];
-  for (const user of ranking) {
-    rows.push(
-      `| ${user.rank} | [${escapeMarkdown(user.login)}](https://github.com/${encodeURIComponent(
-        user.login,
-      )}) | ${user.contributions} |`,
-    );
-  }
-  return `${rows.join("\n")}\n`;
+    .map((user, index) => ({
+      rank: index + 1,
+      login: user.login,
+      contributions: user.contributions,
+    }));
 }
 
 async function main() {
@@ -520,70 +497,21 @@ async function main() {
   }
 
   const token = getToken();
-  const checkpointPath = options.output
-    ? `${options.output}.checkpoint.json`
-    : ".singapore-ranking.checkpoint.json";
-  const checkpointDate = new Date().toISOString().slice(0, 10);
-  const checkpoint = await readCheckpoint(checkpointPath, checkpointDate);
-  const saveCheckpoint = createCheckpointWriter(checkpointPath, checkpoint);
+  const store = await readDataFile(DATA_PATH);
+  const saveData = createDataWriter(DATA_PATH, store);
 
   process.stderr.write("Searching for GitHub users in Singapore...\n");
   const users = await searchSingaporeUsers(token, options.limit);
   if (!users.length) throw new Error("No Singapore users were returned by GitHub Search");
   process.stderr.write(`Found ${users.length} users.\n`);
 
-  for (const user of users) {
-    const saved = checkpoint.users[user.login.toLowerCase()];
-    if (saved?.years) user.years = saved.years;
-    if (Number.isInteger(saved?.contributions)) user.contributions = saved.contributions;
-  }
+  await addContributionYears(token, users);
+  await addAllTimeCounts(token, users, store, saveData);
+  await saveData();
 
-  const usersMissingYears = users.filter((user) => !user.years);
-  if (usersMissingYears.length) {
-    await addContributionYears(token, usersMissingYears, options.concurrency);
-    for (const user of usersMissingYears) {
-      const key = user.login.toLowerCase();
-      checkpoint.users[key] = { ...checkpoint.users[key], years: user.years };
-    }
-    await saveCheckpoint();
-  } else {
-    process.stderr.write(`Loaded active years from checkpoint: ${users.length}/${users.length}\n`);
-  }
-
-  const usersMissingContributions = users.filter(
-    (user) => !Number.isInteger(user.contributions),
-  );
-  if (usersMissingContributions.length) {
-    await addAllTimeCounts(
-      token,
-      usersMissingContributions,
-      options.concurrency,
-      async (completedUsers) => {
-        for (const user of completedUsers) {
-          const key = user.login.toLowerCase();
-          checkpoint.users[key] = {
-            ...checkpoint.users[key],
-            years: user.years,
-            contributions: user.contributions,
-          };
-        }
-        await saveCheckpoint();
-      },
-    );
-  } else {
-    process.stderr.write(`Loaded contributions from checkpoint: ${users.length}/${users.length}\n`);
-  }
-
-  const output = formatRanking(sortRanking(users), options.format);
-  if (options.output) {
-    await writeFile(options.output, output, "utf8");
-    process.stderr.write(`Wrote ${options.output}\n`);
-  } else {
-    process.stdout.write(output);
-  }
-  await unlink(checkpointPath).catch((error) => {
-    if (error.code !== "ENOENT") throw error;
-  });
+  await mkdir(dirname(OUTPUT_PATH), { recursive: true });
+  await writeFile(OUTPUT_PATH, `${JSON.stringify(sortRanking(users), null, 2)}\n`, "utf8");
+  process.stderr.write(`Wrote ${OUTPUT_PATH}\n`);
 }
 
 main().catch((error) => {

@@ -9,7 +9,7 @@ on:
     - cron: "0 18 * * 0"
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -20,7 +20,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -32,26 +32,17 @@ jobs:
           node-version: 24
           package-manager-cache: false
 
-      - name: Restore ranking checkpoint
-        id: ranking-checkpoint
-        uses: actions/cache/restore@v4
-        with:
-          path: site/ranking.json.checkpoint.json
-          key: ranking-checkpoint-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            ranking-checkpoint-${{ runner.os }}-
+      - name: Restore contribution data
+        run: node scripts/data-branch.mjs pull data/contributions.json
 
       - name: Generate ranking data
         run: npm run update
         env:
           GITHUB_TOKEN: ${{ secrets.RANKING_TOKEN || github.token }}
 
-      - name: Save ranking checkpoint after a failed update
-        if: ${{ failure() && hashFiles('site/ranking.json.checkpoint.json') != '' }}
-        uses: actions/cache/save@v4
-        with:
-          path: site/ranking.json.checkpoint.json
-          key: ${{ steps.ranking-checkpoint.outputs.cache-primary-key }}
+      - name: Publish contribution data
+        if: ${{ !cancelled() && hashFiles('data/contributions.json') != '' }}
+        run: node scripts/data-branch.mjs push data/contributions.json
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
