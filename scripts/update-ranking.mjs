@@ -14,6 +14,28 @@ const MAX_REQUEST_ATTEMPTS = 7;
 const MIN_REQUEST_INTERVAL_MS = 1_100;
 const MIN_RATE_LIMIT_DELAY_MS = 60_000;
 const MAX_RATE_LIMIT_DELAY_MS = 5 * 60_000;
+// GitHub stops evaluating a GraphQL query after roughly ten seconds. Fields it
+// did not finish fail with the first pattern; a request that took too long can
+// also fail as a whole, matching the second.
+const QUERY_TOO_EXPENSIVE_PATTERN =
+  /Resource limits for this query exceeded|Something went wrong while executing your query/i;
+const RETRYABLE_ERROR_PATTERN = new RegExp(
+  `${QUERY_TOO_EXPENSIVE_PATTERN.source}|HTTP 5\\d\\d|timed out|socket hang up|ECONNRESET`,
+  "i",
+);
+const CONTRIBUTION_BATCH_SIZE = 10;
+const ITEM_RETRY_DELAY_MS = 5_000;
+// Give up when this many requests in a row fail without resolving any field,
+// so that a GitHub outage fails the run quickly instead of hitting the job
+// timeout (which would also skip publishing the progress made so far).
+const MAX_STALLED_REQUESTS = 20;
+const DAY_MS = 24 * 60 * 60_000;
+// Historical years are re-checked for the users checked longest ago, a few per
+// run, so that every user is re-checked roughly every HISTORY_REFRESH_DAYS.
+const HISTORY_REFRESH_DAYS = 180;
+const HISTORY_REFRESH_USERS_PER_RUN = 40;
+// Refuse to publish a ranking that silently lost a noticeable share of users.
+const MAX_OMITTED_FRACTION = 0.05;
 
 function usage() {
   return `Usage: node scripts/update-ranking.mjs [--limit <number>]
@@ -23,8 +45,10 @@ Singapore, and write ${OUTPUT_PATH}. The score is public
 contribution-calendar activity, summed by year.
 
 Per-year contribution totals are cached in ${DATA_PATH}. Historical years
-never change, so later runs only query the current year and newly discovered
-users, and an interrupted run resumes from the cached years.
+rarely change, so later runs only query the current year, newly discovered
+users, and the history of up to ${HISTORY_REFRESH_USERS_PER_RUN} users not re-checked in
+${HISTORY_REFRESH_DAYS} days. An interrupted run resumes from the cached years. The
+current year's total is stored as well and used when it cannot be refreshed.
 
 Options:
   --limit <number>  Only inspect the first N search results (for testing)
@@ -128,12 +152,12 @@ function retryDelay(response, messages, attempt) {
   return Math.max(retryAfter, 1_000 * 2 ** (attempt - 1));
 }
 
-function isRetryableResponse(response, messages) {
+function isRetryableResponse(response, messages, retryServerErrors) {
   return (
     response.statusCode === 429 ||
     (response.statusCode === 403 && /secondary rate limit/i.test(messages || "")) ||
     (Boolean(messages) && Number(response.headers["x-ratelimit-remaining"]) === 0) ||
-    (response.statusCode >= 500 && response.statusCode <= 503) ||
+    (retryServerErrors && response.statusCode >= 500 && response.statusCode <= 503) ||
     /rate limit|submitted too quickly|temporarily unavailable/i.test(messages || "")
   );
 }
@@ -147,7 +171,15 @@ function pauseBeforeRetry(response, messages, attempt) {
   );
 }
 
-async function requestGraphQL(token, query, variables, attempt = 1) {
+// Batched queries disable retryServerErrors, so that they are split instead.
+async function requestGraphQL(
+  token,
+  query,
+  variables,
+  { retryServerErrors = true, attempt = 1 } = {},
+) {
+  const retry = () =>
+    requestGraphQL(token, query, variables, { retryServerErrors, attempt: attempt + 1 });
   await waitForRequestSlot();
   const body = JSON.stringify({ query, variables });
 
@@ -179,47 +211,42 @@ async function requestGraphQL(token, query, variables, attempt = 1) {
             payload = null;
           }
 
-          if (!payload) {
-            const retryable =
-              isRetryableResponse(response, responseBody) ||
-              (response.statusCode >= 200 && response.statusCode < 300);
-            if (retryable && attempt < MAX_REQUEST_ATTEMPTS) {
-              pauseBeforeRetry(response, responseBody, attempt);
-              try {
-                resolve(await requestGraphQL(token, query, variables, attempt + 1));
-              } catch (error) {
-                reject(error);
-              }
-            } else {
-              reject(
-                new Error(
-                  `GitHub returned HTTP ${response.statusCode} with an empty or non-JSON response`,
-                ),
-              );
-            }
-            return;
-          }
-
-          const messages =
-            payload?.errors?.map((error) => error.message).join("; ") || payload?.message;
-          const retryable = isRetryableResponse(response, messages);
+          const messages = payload
+            ? payload.errors?.map((error) => error.message).join("; ") || payload.message
+            : responseBody;
+          const retryable =
+            isRetryableResponse(response, messages, retryServerErrors) ||
+            (!payload && response.statusCode >= 200 && response.statusCode < 300);
 
           if (retryable && attempt < MAX_REQUEST_ATTEMPTS) {
             pauseBeforeRetry(response, messages, attempt);
             try {
-              resolve(await requestGraphQL(token, query, variables, attempt + 1));
+              resolve(await retry());
             } catch (error) {
               reject(error);
             }
             return;
           }
 
+          if (!payload) {
+            reject(
+              new Error(
+                `GitHub returned HTTP ${response.statusCode} with an empty or non-JSON response`,
+              ),
+            );
+            return;
+          }
           if (response.statusCode < 200 || response.statusCode >= 300) {
             reject(new Error(`GitHub returned HTTP ${response.statusCode}: ${messages || responseBody}`));
             return;
           }
           if (messages) {
-            reject(new Error(`GitHub GraphQL error: ${messages}`));
+            // Keep the partial result: GitHub reports errors per field, and the
+            // fields that did resolve are still usable.
+            const error = new Error(`GitHub GraphQL error: ${messages}`);
+            error.data = payload.data;
+            error.errors = payload.errors;
+            reject(error);
             return;
           }
           resolve(payload.data);
@@ -238,25 +265,6 @@ function chunks(array, size) {
   for (let index = 0; index < array.length; index += size) {
     result.push(array.slice(index, index + size));
   }
-  return result;
-}
-
-function chunksByWeight(array, maximumWeight, getWeight) {
-  const result = [];
-  let chunk = [];
-  let weight = 0;
-
-  for (const item of array) {
-    const itemWeight = Math.max(1, getWeight(item));
-    if (chunk.length && weight + itemWeight > maximumWeight) {
-      result.push(chunk);
-      chunk = [];
-      weight = 0;
-    }
-    chunk.push(item);
-    weight += itemWeight;
-  }
-  if (chunk.length) result.push(chunk);
   return result;
 }
 
@@ -307,136 +315,261 @@ async function searchSingaporeUsers(token, limit) {
   return users;
 }
 
-async function addContributionYears(token, users) {
-  const batches = chunks(users, 30);
-  let completed = 0;
+// Query items as aliased fields, one GraphQL request per batch. GitHub reports
+// fields it ran out of time for individually, so resolved fields are kept and
+// only the rest are queried again, in smaller batches. An item that still
+// fails on its own is retried once, then split with `splitItem` if the failure
+// was its cost, and otherwise handed to `onFailure`, so one difficult account
+// never aborts the whole run. `load` returns whether every item resolved.
+async function queryInBatches(
+  token,
+  batches,
+  { buildField, onResult, onFailure, splitItem = () => null, afterBatch },
+) {
+  let stalledRequests = 0;
+
+  async function load(batch, retried = false) {
+    const fields = batch.map((item, index) => `q${index}: ${buildField(item)}`).join("\n");
+    let data;
+    let errors = [];
+    try {
+      data = await requestGraphQL(token, `query { ${fields} }`, {}, { retryServerErrors: false });
+    } catch (error) {
+      if (!error.data && !RETRYABLE_ERROR_PATTERN.test(error.message)) throw error;
+      data = error.data ?? {};
+      errors = error.errors ?? [{ message: error.message }];
+    }
+
+    // Every queried field below `user` is non-null, so any error inside an
+    // alias nulls the whole alias.
+    const queryError = errors.find((error) => !error.path);
+    const failed = [];
+    let resolved = true;
+    const fail = (item, reason) => {
+      onFailure(item, reason);
+      resolved = false;
+    };
+    batch.forEach((item, index) => {
+      const result = data[`q${index}`];
+      const error = errors.find((error) => error.path?.[0] === `q${index}`) ?? queryError;
+      if (result != null) {
+        onResult(item, result);
+      } else if (!error || error.type === "NOT_FOUND") {
+        fail(item, "GitHub user not found");
+      } else if (RETRYABLE_ERROR_PATTERN.test(error.message)) {
+        failed.push({ item, error });
+      } else {
+        fail(item, error.message);
+      }
+    });
+    if (failed.length < batch.length) {
+      stalledRequests = 0;
+    } else if (++stalledRequests >= MAX_STALLED_REQUESTS) {
+      throw new Error(
+        `GitHub failed ${stalledRequests} requests in a row: ${failed[0].error.message}`,
+      );
+    }
+    if (!failed.length) return resolved;
+
+    const items = failed.map(({ item }) => item);
+    if (items.length < batch.length) {
+      return (await load(items)) && resolved;
+    }
+    if (items.length > 1) {
+      const middle = Math.ceil(items.length / 2);
+      const first = await load(items.slice(0, middle));
+      return (await load(items.slice(middle))) && first;
+    }
+    if (!retried) {
+      await delay(ITEM_RETRY_DELAY_MS);
+      return load(items, true);
+    }
+    // Parts are queried one at a time, since together they cost as much as the
+    // whole, and not retried. The first part that fails dooms the item, so the
+    // remaining parts are skipped.
+    const [{ item, error }] = failed;
+    const parts = QUERY_TOO_EXPENSIVE_PATTERN.test(error.message) && splitItem(item);
+    if (!parts) {
+      fail(item, error.message);
+      return false;
+    }
+    for (const part of parts) {
+      if (!(await load([part], true))) return false;
+    }
+    return true;
+  }
 
   for (const batch of batches) {
-    const fields = batch
-      .map(
-        (user, index) =>
-          `u${index}: user(login: ${JSON.stringify(user.login)}) { ` +
-          "contributionsCollection { contributionYears } }",
-      )
-      .join("\n");
-    const data = await requestGraphQL(token, `query { ${fields} }`, {});
-
-    batch.forEach((user, index) => {
-      const years = data[`u${index}`]?.contributionsCollection?.contributionYears;
-      if (!years) throw new Error(`GitHub user disappeared while querying: ${user.login}`);
-      user.years = [...new Set(years)].sort((left, right) => left - right);
-    });
-
-    completed += batch.length;
-    process.stderr.write(`Loaded active years: ${completed}/${users.length}\r`);
+    await load(batch);
+    await afterBatch(batch);
   }
+}
+
+async function addContributionYears(token, users) {
+  let completed = 0;
+
+  await queryInBatches(token, chunks(users, 30), {
+    buildField: (user) =>
+      `user(login: ${JSON.stringify(user.login)}) { contributionsCollection { contributionYears } }`,
+    onResult: (user, result) => {
+      const years = result.contributionsCollection.contributionYears;
+      user.years = [...new Set(years)].sort((left, right) => left - right);
+    },
+    onFailure: (user, reason) => {
+      process.stderr.write(`\nWarning: could not load active years for ${user.login}: ${reason}\n`);
+    },
+    afterBatch: (batch) => {
+      completed += batch.length;
+      process.stderr.write(`Loaded active years: ${completed}/${users.length}\r`);
+    },
+  });
   process.stderr.write("\n");
 }
 
-function contributionCollectionField(year, currentYear, now) {
-  const from = `${year}-01-01T00:00:00Z`;
-  const to =
-    year === currentYear ? now.toISOString() : `${year}-12-31T23:59:59Z`;
+function yearRange(year, currentYear, now) {
+  return {
+    from: new Date(Date.UTC(year, 0, 1)),
+    to: year === currentYear ? now : new Date(Date.UTC(year + 1, 0, 1) - 1_000),
+  };
+}
 
-  return `y${year}: contributionsCollection(from: ${JSON.stringify(from)}, to: ${JSON.stringify(to)}) {
-    contributionCalendar { totalContributions }
-    restrictedContributionsCount
+// Split a contribution range in half at a UTC day boundary, so that a burst of
+// activity too expensive to count in one go (thousands of contributions in a
+// single week exist) is counted piece by piece, down to a week or less. This
+// is a last resort: GitHub buckets contributions by day in the account's time
+// zone, so the parts can add up to a total that differs by a few.
+function splitRange(unit) {
+  const days = Math.floor((unit.to - unit.from) / DAY_MS);
+  if (days <= 7) return null;
+  const middle = new Date(unit.from.getTime() + Math.floor(days / 2) * DAY_MS);
+  unit.slot.remaining += 1;
+  return [
+    { slot: unit.slot, from: unit.from, to: new Date(middle - 1_000) },
+    { slot: unit.slot, from: middle, to: unit.to },
+  ];
+}
+
+function contributionField(unit) {
+  const from = JSON.stringify(unit.from.toISOString());
+  const to = JSON.stringify(unit.to.toISOString());
+  return `user(login: ${JSON.stringify(unit.slot.user.login)}) {
+    c: contributionsCollection(from: ${from}, to: ${to}) {
+      contributionCalendar { totalContributions }
+      restrictedContributionsCount
+    }
   }`;
 }
 
-function sumContributions(user, currentYear, fresh) {
+// Returns null when a year is neither cached nor freshly loaded. A stored
+// current-year count also stands in for that year once it is over, until the
+// final count has been loaded.
+function sumContributions(years, entry, currentYear) {
   let total = 0;
-  for (const year of user.years) {
-    if (year > currentYear) continue;
+  for (const year of years) {
     const value =
-      year === currentYear ? fresh[year] : (user.cachedYears[year] ?? fresh[year]);
-    total += value ?? 0;
+      (year !== currentYear ? entry?.years[year] : null) ??
+      (entry?.current?.year === year ? entry.current.contributions : null);
+    if (value == null) return null;
+    total += value;
   }
   return total;
+}
+
+// Historical counts still drift now and then (for example when a repository
+// is deleted), so each run also re-queries the whole history of the users
+// whose history was checked longest ago. Users without a check date, such as
+// those cached before check dates were recorded, come first.
+function selectHistoryRefresh(users, store, currentYear, now) {
+  const staleBefore = new Date(now - HISTORY_REFRESH_DAYS * DAY_MS).toISOString().slice(0, 10);
+  const checkedAt = (user) => store.users[user.login.toLowerCase()]?.checkedAt ?? "";
+  return new Set(
+    users
+      .filter(
+        (user) =>
+          store.users[user.login.toLowerCase()] &&
+          user.years.some((year) => year < currentYear) &&
+          checkedAt(user) < staleBefore,
+      )
+      .sort((left, right) => checkedAt(left).localeCompare(checkedAt(right)))
+      .slice(0, HISTORY_REFRESH_USERS_PER_RUN),
+  );
 }
 
 async function addAllTimeCounts(token, users, store, saveData) {
   const now = new Date();
   const currentYear = now.getUTCFullYear();
+  const today = now.toISOString().slice(0, 10);
+  // Users whose active years could not be loaded are left out of the ranking.
+  users = users.filter((user) => user.years);
+  for (const user of users) user.years = user.years.filter((year) => year <= currentYear);
+  const refreshUsers = selectHistoryRefresh(users, store, currentYear, now);
+  if (refreshUsers.size) {
+    process.stderr.write(`Re-checking historical years for ${refreshUsers.size} users.\n`);
+  }
 
-  // Historical years never change, so only the current year and years missing
-  // from the persistent store are queried again.
+  const units = [];
   for (const user of users) {
-    user.cachedYears = store.users[user.login.toLowerCase()]?.years ?? {};
-    user.pendingYears = user.years.filter(
-      (year) =>
-        year <= currentYear &&
-        (year === currentYear || user.cachedYears[year] == null),
-    );
-    if (!user.pendingYears.length) {
-      user.contributions = sumContributions(user, currentYear, {});
+    const entry = store.users[user.login.toLowerCase()];
+    const cachedYears = entry?.years ?? {};
+    // A user's history counts as checked once every historical year has been
+    // loaded in this run, which is the case for new users as well.
+    user.historyCheck = !entry || refreshUsers.has(user);
+    user.historyPending = 0;
+    for (const year of user.years) {
+      if (year !== currentYear) {
+        if (cachedYears[year] != null && !user.historyCheck) continue;
+        user.historyPending += 1;
+      }
+      const slot = { user, year, total: 0, remaining: 1 };
+      units.push({ slot, ...yearRange(year, currentYear, now) });
     }
   }
 
-  const pendingUsers = users.filter((user) => user.pendingYears.length);
-  // Start with a compact batch and split it automatically if GitHub assigns
-  // more resource cost to a group of particularly active accounts.
-  const batches = chunksByWeight(pendingUsers, 20, (user) => user.pendingYears.length);
-  let completed = users.length - pendingUsers.length;
+  let completed = 0;
 
-  async function loadBatch(batch) {
-    const fields = batch
-      .map((user, index) => {
-        const years = user.pendingYears
-          .map((year) => contributionCollectionField(year, currentYear, now))
-          .join("\n");
-        return `u${index}: user(login: ${JSON.stringify(user.login)}) { ${years} }`;
-      })
-      .join("\n");
-    let data;
-    try {
-      data = await requestGraphQL(token, `query { ${fields} }`, {});
-    } catch (error) {
-      if (
-        /Resource limits for this query exceeded|HTTP 50[24]/i.test(error.message) &&
-        batch.length > 1
-      ) {
-        const middle = Math.ceil(batch.length / 2);
-        await loadBatch(batch.slice(0, middle));
-        await loadBatch(batch.slice(middle));
-        return;
-      }
-      throw error;
-    }
+  await queryInBatches(token, chunks(units, CONTRIBUTION_BATCH_SIZE), {
+    buildField: contributionField,
+    onResult: (unit, result) => {
+      const { slot } = unit;
+      const collection = result.c;
+      slot.total += Math.max(
+        0,
+        collection.contributionCalendar.totalContributions -
+          collection.restrictedContributionsCount,
+      );
+      // A failed part never decrements `remaining`, so zero means all succeeded.
+      slot.remaining -= 1;
+      if (slot.remaining) return;
 
-    batch.forEach((user, index) => {
-      const result = data[`u${index}`];
-      if (!result) throw new Error(`GitHub user disappeared while querying: ${user.login}`);
-
-      const fresh = {};
-      for (const year of user.pendingYears) {
-        const yearResult = result[`y${year}`];
-        if (!yearResult) continue;
-        const total = yearResult.contributionCalendar.totalContributions;
-        const privateContributions = yearResult.restrictedContributionsCount;
-        fresh[year] = Math.max(0, total - privateContributions);
-      }
-
+      const { user } = slot;
       const entry = (store.users[user.login.toLowerCase()] ??= { years: {} });
-      for (const year of user.pendingYears) {
-        if (year !== currentYear && fresh[year] != null) {
-          entry.years[year] = fresh[year];
-          user.cachedYears[year] = fresh[year];
-        }
+      if (slot.year === currentYear) {
+        entry.current = { year: currentYear, contributions: slot.total };
+      } else {
+        entry.years[slot.year] = slot.total;
+        user.historyPending -= 1;
+        if (user.historyCheck && !user.historyPending) entry.checkedAt = today;
       }
-
-      user.contributions = sumContributions(user, currentYear, fresh);
-    });
-
-    completed += batch.length;
-    process.stderr.write(`Loaded contributions: ${completed}/${users.length}\r`);
-    await saveData();
-  }
-
-  for (const batch of batches) {
-    await loadBatch(batch);
-  }
+    },
+    onFailure: (unit, reason) => {
+      process.stderr.write(
+        `\nWarning: could not load ${unit.slot.year} contributions for ` +
+          `${unit.slot.user.login}: ${reason}\n`,
+      );
+    },
+    splitItem: splitRange,
+    afterBatch: async (batch) => {
+      completed += batch.length;
+      process.stderr.write(`Loaded contributions: ${completed}/${units.length}\r`);
+      await saveData();
+    },
+  });
   process.stderr.write("\n");
+
+  for (const user of users) {
+    const entry = store.users[user.login.toLowerCase()];
+    user.contributions = sumContributions(user.years, entry, currentYear);
+  }
 }
 
 async function readDataFile(path) {
@@ -509,8 +642,23 @@ async function main() {
   await addAllTimeCounts(token, users, store, saveData);
   await saveData();
 
+  const ranked = users.filter((user) => user.contributions != null);
+  const omitted = users.filter((user) => user.contributions == null);
+  if (omitted.length) {
+    process.stderr.write(
+      `Warning: leaving out ${omitted.length} users with incomplete data: ` +
+        `${omitted.map((user) => user.login).join(", ")}\n`,
+    );
+  }
+  if (omitted.length > users.length * MAX_OMITTED_FRACTION) {
+    throw new Error(
+      `Too many users (${omitted.length}/${users.length}) have incomplete data; ` +
+        "the ranking was not written. Cached progress is kept for the next run.",
+    );
+  }
+
   await mkdir(dirname(OUTPUT_PATH), { recursive: true });
-  await writeFile(OUTPUT_PATH, `${JSON.stringify(sortRanking(users), null, 2)}\n`, "utf8");
+  await writeFile(OUTPUT_PATH, `${JSON.stringify(sortRanking(ranked), null, 2)}\n`, "utf8");
   process.stderr.write(`Wrote ${OUTPUT_PATH}\n`);
 }
 

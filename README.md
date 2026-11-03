@@ -28,7 +28,7 @@ Open <http://localhost:8000> to preview the site. The generated `site/ranking.js
 
 If you have already run `gh auth login`, the script can read the token directly from `gh auth token`, so you do not need to set the environment variable. Do not use or commit browser cookies.
 
-Per-year contribution totals are cached in `data/contributions.json`. Historical years never change, so later runs only query the current year and newly discovered users, and an interrupted run resumes from the cached years. The file is ignored by Git locally and synchronized with the dedicated `ranking-data` branch:
+Per-year contribution totals are cached in `data/contributions.json`. Historical years rarely change, so later runs only query the current year and newly discovered users, and an interrupted run resumes from the cached years. Counts for past years can still drift slightly (for example when a repository is deleted), so each run also re-checks the full history of the 40 users whose history was checked longest ago; every user is re-checked roughly every 180 days. The file is ignored by Git locally and synchronized with the dedicated `ranking-data` branch:
 
 ```sh
 npm run data:pull   # download the data file from the ranking-data branch (optional)
@@ -41,6 +41,8 @@ The first full run queries every active year of every user and can take a long t
 ## Automated updates
 
 GitHub Actions rebuilds and deploys the website on every push to `main` and every Monday at 02:00 Singapore Time. Each run downloads the per-year contribution data from the `ranking-data` branch, refreshes the current year (and any newly discovered users), and pushes the updated data back to that branch. The ranking is also rendered into static HTML by `scripts/render-page.mjs`, so the table is visible to search engines and to browsers without JavaScript. The workflow uses the repository's `GITHUB_TOKEN` by default. If you encounter API permission or rate-limit issues, create a `RANKING_TOKEN` repository secret.
+
+GitHub stops evaluating a GraphQL query after about ten seconds, so contribution counts are queried in small batches, and fields GitHub could not finish are queried again on their own. If an account's current-year count still cannot be refreshed, the count stored by the previous run is used; accounts without any stored count are left out of that run with a warning. The run only fails when more than 5% of the accounts would be left out, or when GitHub fails 20 requests in a row; progress is still saved to the data branch in that case.
 
 Initialize the data branch locally before the first automated run (see above), so that the workflow never needs to re-query every historical year.
 
