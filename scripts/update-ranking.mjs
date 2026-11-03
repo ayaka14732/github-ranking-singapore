@@ -15,10 +15,10 @@ const MIN_REQUEST_INTERVAL_MS = 1_100;
 const MIN_RATE_LIMIT_DELAY_MS = 60_000;
 const MAX_RATE_LIMIT_DELAY_MS = 5 * 60_000;
 // GitHub stops evaluating a GraphQL query after roughly ten seconds. Fields it
-// did not finish fail with the first pattern; a request that took too long can
-// also fail as a whole, matching the second.
+// did not finish fail with the first pattern, as does a request that timed out
+// as a whole with a 502 or 504; the second adds other transient failures.
 const QUERY_TOO_EXPENSIVE_PATTERN =
-  /Resource limits for this query exceeded|Something went wrong while executing your query/i;
+  /Resource limits for this query exceeded|Something went wrong while executing your query|HTTP 50[24]/i;
 const RETRYABLE_ERROR_PATTERN = new RegExp(
   `${QUERY_TOO_EXPENSIVE_PATTERN.source}|HTTP 5\\d\\d|timed out|socket hang up|ECONNRESET`,
   "i",
